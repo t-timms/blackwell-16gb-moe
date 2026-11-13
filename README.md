@@ -47,7 +47,8 @@ Quantization alone does not get a 35B MoE into 16 GB. Concretely, for KAT-Coder-
 Ornith-1.5-35B-A3B is the same story: its vendor publishes several quant variants, and I
 measured every one directly rather than trusting the README. The smallest is a GGUF Q4_K_M at
 **21.71 GiB** -- still 5.7 GB over a 16 GB card and further over a realistic serving budget.
-There is no quantization-only path.
+There is no quantization-only path for serving with everything in VRAM, which is what vLLM
+does. For single-user llama.cpp, the MoE expert cache changes this answer. See section 10.
 
 50% expert pruning is the ceiling I will run without a recovery step. Published results above
 that start showing measurable long-horizon-editing degradation, and it is not safe to assume
@@ -275,6 +276,63 @@ not exist was one you could run on a consumer card with the evaluation attached.
 - **Read the artifact, not the log.** "2000/2000 calibrated, 0 repaired" was true of the
   in-process state and false of what reached disk. If something must persist, re-open the file
   and check.
+
+## 10. Follow-up (Nov 2026): when pruning stops being worth it
+
+I ran the same pipeline on a third `qwen3_5_moe` base,
+[Sage-A1.5](https://huggingface.co/InternScience/Sage-A1.5) (35B-A3B), this time targeting
+llama.cpp GGUF instead of vLLM. I didn't release it. Here is why.
+
+Two things changed. llama.cpp gained an **MoE expert cache** (`--moe-cache-mib`). Expert weights stay in host RAM and a fixed-size VRAM cache holds the
+experts in use, so an unpruned Q4_K_M (21 GB) now runs on a 16 GB card. Separately, a public mixed-precision quant
+([APEX-I-NanoPlus](https://hf.co/IsValorum/Sage-A1.5-APEX-I-NanoPlus-V2.1-GGUF), 13 GB) fits
+entirely in VRAM without removing any experts.
+
+Measured on one RTX 5070 Ti (Ryzen 5 7600, WSL2 VM capped at 64 GB RAM), llama.cpp build 1536 (`e01c9f18`), with the
+same script for every file in one session. Setup: one slot, ctx 32768, `-fa on -t 6`, the model
+card's sampling, MTP off. Decode is the median of 3 requests of 768 tokens. Prompt read is the median of
+2 requests with a 14,812-token prompt. KLD is measured against the unpruned bf16 logits at ctx 512,
+on held-out Mixture-of-Thoughts (in-domain for the prune calibration) and on wikitext-2 test.
+
+| file | args | decode tok/s | prompt read tok/s | VRAM | KLD in-domain / wikitext |
+|---|---|---:|---:|---:|---|
+| unpruned [official Q4_K_M](https://hf.co/InternScience/Sage-A1.5-Q4_K_M-GGUF), 21.17 GB | `-ngl 99 -cmoe --moe-cache-mib 11968` | 93.6 | 652 | 15.6 GB | **0.0166 / 0.0351** |
+| unpruned Q4_K_M | `-ngl 99 -cmoe --moe-cache-mib 9280` | 83.8 | 531 | 13.0 GB | same |
+| unpruned Q4_K_M | `-fit on -fitt 1024` (no cache) | 67.6 | 1054 | 15.0 GB | same |
+| APEX-I-NanoPlus, 13.03 GB | `-fit on -fitt 1024` | 152.1 | 5152 | 13.7 GB | 0.0366 / 0.0872 |
+| my REAP-37 i1-IQ4_XS, 12.28 GB | `-fit on -fitt 1024` | 155.7 | 6432 | 13.5 GB | 0.0331 / 0.4018 |
+
+- **For quality, the unpruned model with the cache wins outright.** It decodes at 94 tok/s, but
+  needs ~20 GB of host RAM and reads long prompts 8-10x slower than the 13 GB files.
+  At 15.6 GB, the 11968 MiB setting won't fit next to a game or OBS; 9280 is the everyday setting.
+- **At ~13 GB, APEX ties the prune on speed (+2 %).** The prune's KL divergence on general text
+  (wikitext) is 4.6x worse. Removing 37 % of experts without recovery training damages text outside
+  the calibration domain. Re-pruning with prose added to the calibration still left wikitext KLD
+  about 4x APEX's. Adding prose to the imatrix text made no difference (0.3634 vs 0.3653).
+- **The gate I now run before any MoE prune:** measure the unpruned Q4 with the expert cache
+  on the target card first. Prune only if that is unusably slow, or if the base doesn't fit in
+  VRAM + RAM at all.
+
+**The Blackwell FP4 tensor cores in llama.cpp, measured.** llama.cpp has an NVFP4/MXFP4 kernel that uses
+SM120's block-scaled FP4 MMA (`m16n8k64`). It only runs for batched prompt processing with 4-bit
+activations. Token-by-token decode takes a different path. The same pruned model, quantized to plain
+NVFP4 (12.89 GB), same script and `-fit on -fitt 1024`:
+
+| setup | decode tok/s | prompt read tok/s | KLD in-domain / wikitext |
+|---|---:|---:|---|
+| NVFP4, native FP4 (4-bit activations) | 156.1 | **8007** | 0.0684 / 0.4633 |
+| NVFP4, `GGML_CUDA_MMQ_PREC=q8` (8-bit activations) | 157.1 | 5512 | 0.0528 / 0.4357 |
+| i1-IQ4_XS control | 155.2 | 6463 | 0.0331 / 0.4018 |
+
+The FP4 cores are real: +45 % prompt reading on the same file. They add nothing to generation speed.
+Plain (untuned) NVFP4 costs about 2x the in-domain KLD of an imatrix IQ4_XS. On this card, NVFP4-GGUF is a
+prompt-speed option for long-context agent loops, not a quality or decode win. A tuned NVFP4
+quantizer (imatrix + scale fitting) was not measured.
+
+To reproduce: `llama-server` with the args in each row plus `-c 32768 -np 1 -fa on -t 6 --jinja --reasoning-format deepseek`;
+KLD with `llama-perplexity --kl-divergence-base <bf16 logits> --kl-divergence -c 512`; the
+NVFP4 file with `llama-quantize --tensor-type '^blk\.=nvfp4' <bf16.gguf> <out.gguf> Q4_K_M`.
+Each speed row is one session's median, and KLD is one deterministic pass.
 
 Code and full build trails: [github.com/t-timms](https://github.com/t-timms). The ZAYA1 work
 has a standalone write-up ([`PAPER.md`](https://github.com/t-timms/zaya1-nvfp4-w4a4)) with the
